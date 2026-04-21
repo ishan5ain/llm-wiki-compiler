@@ -105,6 +105,7 @@ export async function findRelevantPages(
 ): Promise<Array<{ slug: string; title: string; summary: string }>> {
   const store = await readEmbeddingStore(root);
   if (!store || store.entries.length === 0) return [];
+  if (store.model !== resolveEmbeddingModel()) return [];
 
   const queryVec = await getProvider().embed(question);
   return findTopK(queryVec, store, EMBEDDING_TOP_K).map((entry) => ({
@@ -173,8 +174,13 @@ async function embedPages(
 }
 
 /** Choose the active embedding model name, defaulting to anthropic's voyage model. */
-function resolveEmbeddingModel(): string {
-  return EMBEDDING_MODELS[getActiveProviderName()] ?? EMBEDDING_MODELS.anthropic;
+export function resolveEmbeddingModel(): string {
+  const providerName = getActiveProviderName();
+  const configuredModel = process.env.LLMWIKI_EMBEDDING_MODEL?.trim();
+  if (configuredModel && (providerName === "openai" || providerName === "ollama")) {
+    return configuredModel;
+  }
+  return EMBEDDING_MODELS[providerName] ?? EMBEDDING_MODELS.anthropic;
 }
 
 /** Merge fresh embeddings into an existing store, dropping slugs not in liveSlugs. */
@@ -200,17 +206,18 @@ function mergeEntries(
 export async function updateEmbeddings(root: string, changedSlugs: string[]): Promise<void> {
   const records = await collectPageRecords(root);
   const liveSlugs = new Set(records.map((r) => r.slug));
-  const toEmbed = new Set(changedSlugs.filter((slug) => liveSlugs.has(slug)));
-
+  const embeddingModel = resolveEmbeddingModel();
   const existingStore = await readEmbeddingStore(root);
-  const previousEntries = existingStore?.entries ?? [];
+  const modelChanged = Boolean(existingStore && existingStore.model !== embeddingModel);
+  const toEmbed = new Set(changedSlugs.filter((slug) => liveSlugs.has(slug)));
+  const previousEntries = modelChanged ? [] : existingStore?.entries ?? [];
 
   // Cold start: embed every page so the store is immediately useful.
-  if (!existingStore) {
+  if (!existingStore || modelChanged) {
     for (const record of records) toEmbed.add(record.slug);
   }
 
-  if (toEmbed.size === 0 && previousEntries.every((e) => liveSlugs.has(e.slug))) {
+  if (!modelChanged && toEmbed.size === 0 && previousEntries.every((e) => liveSlugs.has(e.slug))) {
     return;
   }
 
@@ -220,7 +227,7 @@ export async function updateEmbeddings(root: string, changedSlugs: string[]): Pr
   const dimensions = mergedEntries[0]?.vector.length ?? 0;
   const store: EmbeddingStore = {
     version: 1,
-    model: resolveEmbeddingModel(),
+    model: embeddingModel,
     dimensions,
     entries: mergedEntries,
   };
