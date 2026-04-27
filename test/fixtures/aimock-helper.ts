@@ -26,6 +26,10 @@
  */
 
 import { LLMock } from "@copilotkit/aimock";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import path from "path";
+import { tmpdir } from "os";
+import { afterEach } from "vitest";
 
 /** Handle returned from {@link startMockClaude}. */
 export interface MockClaudeHandle {
@@ -54,6 +58,10 @@ export async function stopMockClaude(handle: MockClaudeHandle): Promise<void> {
  * Env overrides to inject into `runCLI` so the CLI subprocess routes
  * Anthropic API calls to the mock. The mock-key value is arbitrary —
  * the CLI's credential check only verifies the env var is non-empty.
+ *
+ * Note: Anthropic embeddings go to Voyage (a different host) which is
+ * NOT intercepted by this helper. Use {@link mockOpenAIEnv} for tests
+ * that need both completions and embeddings stubbed under one base URL.
  */
 export function mockClaudeEnv(handle: MockClaudeHandle): NodeJS.ProcessEnv {
   return {
@@ -63,4 +71,85 @@ export function mockClaudeEnv(handle: MockClaudeHandle): NodeJS.ProcessEnv {
     // doesn't bypass the Anthropic mock.
     LLMWIKI_PROVIDER: "anthropic",
   };
+}
+
+/**
+ * Env overrides for OpenAI-mode subprocess tests. Use this when the test
+ * needs both chat and embedding calls intercepted (the OpenAI provider
+ * routes both through OPENAI_BASE_URL, unlike the Anthropic provider
+ * which uses Voyage for embeddings).
+ *
+ * @param handle - aimock handle from {@link startMockClaude}.
+ * @param model - Optional model name override (defaults to "gpt-4o").
+ */
+export function mockOpenAIEnv(
+  handle: MockClaudeHandle,
+  model = "gpt-4o",
+): NodeJS.ProcessEnv {
+  return {
+    OPENAI_BASE_URL: `${handle.url}/v1`,
+    OPENAI_API_KEY: "mock-key-for-aimock",
+    LLMWIKI_PROVIDER: "openai",
+    LLMWIKI_MODEL: model,
+    LLMWIKI_EMBEDDING_MODEL: "text-embedding-3-small",
+  };
+}
+
+/** Live state managed by {@link useAimockLifecycle}. */
+export interface AimockLifecycle {
+  /** Currently-running mock, or null between tests. Set by `start()`. */
+  handle: MockClaudeHandle | null;
+  /** Start a fresh mock and store the handle in `lifecycle.handle`. */
+  start: () => Promise<MockClaudeHandle>;
+  /** Create a temp project workspace with sources/ + one source file. */
+  makeWorkspace: (sourceContent: string, sourceName?: string) => Promise<string>;
+}
+
+/**
+ * Vitest composable that wires up afterEach cleanup for an aimock-backed
+ * subprocess test: stops the mock if one was started, then removes any
+ * temp workspaces created by `makeWorkspace`. Avoids per-file boilerplate
+ * for the common pattern.
+ *
+ * @example
+ * ```
+ * const aimock = useAimockLifecycle("my-test");
+ * it("...", async () => {
+ *   const handle = await aimock.start();
+ *   handle.mock.onMessage(/.* /, { content: "..." });
+ *   const cwd = await aimock.makeWorkspace("# source\n");
+ *   const result = await runCLI(["compile"], cwd, mockOpenAIEnv(handle));
+ *   ...
+ * });
+ * ```
+ */
+export function useAimockLifecycle(workspacePrefix: string): AimockLifecycle {
+  const tempDirs: string[] = [];
+  const lifecycle: AimockLifecycle = {
+    handle: null,
+    async start(): Promise<MockClaudeHandle> {
+      lifecycle.handle = await startMockClaude();
+      return lifecycle.handle;
+    },
+    async makeWorkspace(sourceContent: string, sourceName = "intro.md"): Promise<string> {
+      const cwd = await mkdtemp(path.join(tmpdir(), `llmwiki-${workspacePrefix}-`));
+      tempDirs.push(cwd);
+      await mkdir(path.join(cwd, "sources"), { recursive: true });
+      await writeFile(path.join(cwd, "sources", sourceName), sourceContent, "utf-8");
+      return cwd;
+    },
+  };
+
+  afterEach(async () => {
+    if (lifecycle.handle) {
+      await stopMockClaude(lifecycle.handle);
+      lifecycle.handle = null;
+    }
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  return lifecycle;
 }
